@@ -1,184 +1,215 @@
-import {
-  mkdir, access, writeFile, readFile,
-} from 'fs/promises';
-import { constants, access as checkExists } from 'fs';
-import { v4 } from 'uuid';
-import { join } from 'path';
-import { ObjectId } from 'mongodb';
-import { lookup } from 'mime-types';
-import dbClient from '../utils/db';
-import redisClient from '../utils/redis';
+import { existsSync, promises } from 'fs';
+import mime from 'mime-types';
+import { getCurrentUser } from '../utils/auth';
+import File, { FOLDER, FilesCollection } from '../utils/file';
+import fileQueue from '../worker';
 
-const fileTypes = ['folder', 'file', 'image'];
+const { readFile } = promises;
 
-function _screenFile(objField) {
-  const field = { ...objField };
-  field.id = field._id;
-  delete field._id;
-  delete field.localPath;
-  return field;
-}
+/**
+ * FilesController class to manage user files
+ */
+class FilesController {
+  /**
+   * Handles uploading a file by creating a new File object and saving it to
+   * the database.
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @return {Object} The saved file as a JSON object, or an error message as a
+   * JSON object.
+   */
+  static async postUpload(request, response) {
+    const currentUser = await getCurrentUser(request);
 
-export default class FilesController {
-  static async postUpload(req, res) {
-    const { name, type, data } = req.body;
-    const isPublic = req.body.isPublic || false;
-    const parentId = req.body.parentId || 0;
-
-    if (!name) return res.status(400).json({ error: 'Missing name' });
-
-    if (!type || !(fileTypes.includes(type))) return res.status(400).json({ error: 'Missing type' });
-
-    if (!data && type !== 'folder') return res.status(400).json({ error: 'Missing data' });
-
-    if (parentId) {
-      const fileObj = await dbClient.getField('files', { _id: ObjectId(parentId) });
-
-      if (!fileObj) return res.status(400).json({ error: 'Parent not found' });
-      if (fileObj.type !== 'folder') return res.status(400).json({ error: 'Parent is not a folder' });
-    }
-
-    if (type === 'folder') {
-      const insertResult = await dbClient.insertCol('files', {
-        userId: ObjectId(req.userId),
-        name,
-        type,
-        parentId: parentId === 0 ? parentId : ObjectId(parentId),
-        isPublic,
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
       });
-
-      return res.status(201).json(_screenFile(insertResult));
     }
 
-    const folderPath = process.env.FOLDER_PATH || '/tmp/files_manager';
+    const {
+      name, type, parentId, isPublic, data,
+    } = request.body;
+
     try {
-      // check if folder is accessible, if not an error is raised
-      // eslint-disable-next-line no-bitwise
-      await access(folderPath, constants.R_OK | constants.W_OK | constants.X_OK);
-    } catch (e) {
-      // create directories recursively
-      await mkdir(folderPath, { recursive: true });
-    }
-
-    // eslint-disable-next-line new-cap
-    const buff = new Buffer.from(data, 'base64');
-    const content = buff.toString('utf8');
-
-    const uniqueFile = v4();
-    const localPath = join(folderPath, uniqueFile);
-    await writeFile(localPath, content);
-
-    const result = await dbClient.insertCol('files', {
-      userId: ObjectId(req.userId),
-      name,
-      type,
-      parentId: parentId === 0 ? parentId : ObjectId(parentId),
-      isPublic,
-      localPath,
-    });
-
-    return res.status(201).json(_screenFile(result));
-  }
-
-  static async getShow(req, res) {
-    const { id } = req.params;
-    const checkObj = { _id: ObjectId(id), userId: ObjectId(req.userId) };
-    const fileObj = await dbClient.getField('files', checkObj);
-
-    if (!fileObj) return res.status(401).json({ error: 'Unauthorized' });
-
-    return res.status(200).json(_screenFile(fileObj));
-  }
-
-  static async getindex(req, res) {
-    const { parentId, page } = req.query;
-
-    if (parentId) {
-      // get one field to check if user has a folder with parentId
-      const checkObj = { _id: ObjectId(parentId), userId: ObjectId(req.userId), type: 'folder' };
-      const oneField = await dbClient.getField('files', checkObj);
-
-      // no folder present
-      if (!oneField) return res.status(200).json([]);
-
-      const allParentId = await dbClient.getAll('files', {
-        parentId: ObjectId(parentId), userId: ObjectId(req.userId),
-      },
-      { page: 0 });
-
-      return res.status(200).json(allParentId);
-    }
-
-    // paginate the files present for a user
-    const pageCount = page || 0;
-    const allFiles = await dbClient.getAll('files', { userId: ObjectId(req.userId) }, { page: pageCount });
-    return res.status(200).json(allFiles);
-  }
-
-  static async putPublish(req, res) {
-    const { id } = req.params;
-
-    const objField = await dbClient.getField('files',
-      { _id: ObjectId(id), userId: ObjectId(req.userId) });
-
-    if (!objField) return res.status(404).json({ error: 'Not found' });
-
-    await dbClient.updateField('files',
-      { _id: ObjectId(id), userId: ObjectId(req.userId) }, { isPublic: true });
-
-    objField.isPublic = true;
-
-    return res.status(200).json(_screenFile(objField));
-  }
-
-  static async putUnpublish(req, res) {
-    const { id } = req.params;
-
-    const objField = await dbClient.getField('files',
-      { _id: ObjectId(id), userId: ObjectId(req.userId) });
-
-    if (!objField) return res.status(404).json({ error: 'Not found' });
-
-    await dbClient.updateField('files',
-      { _id: ObjectId(id), userId: ObjectId(req.userId) }, { isPublic: false });
-
-    objField.isPublic = false;
-
-    return res.status(200).json(_screenFile(objField));
-  }
-
-  // eslint-disable-next-line consistent-return
-  static async getFile(req, res) {
-    const { id } = req.params;
-    const tokenKey = `auth_${req.get('X-Token')}`;
-
-    const userId = await redisClient.get(tokenKey);
-
-    const fieldObj = await dbClient.getField('files', { _id: ObjectId(id) });
-
-    if (!fieldObj) return res.status(404).json({ error: 'Not found' });
-
-    if (!fieldObj.isPublic && !userId) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-
-    if (fieldObj.type === 'folder') {
-      return res.status(400).json({ error: "A folder doesn't have content" });
-    }
-
-    if (!fieldObj.localPath) return res.status(400).json({ error: 'Not found' });
-    // eslint-disable-next-line consistent-return
-    checkExists(fieldObj.localPath, constants.F_OK, (err) => {
-      if (err) return res.status(400).json({ error: 'Not found' });
-    });
-    try {
-      const mimetype = lookup(fieldObj.name);
-      const readData = await readFile(fieldObj.localPath);
-
-      res.setHeader('Content-Length', readData.length);
-      return res.type(mimetype).send(readData);
+      const file = new File(
+        currentUser.id, name, type, parentId, isPublic, data,
+      );
+      const savedFile = await file.save();
+      if (savedFile.type === 'image') {
+        fileQueue.add({
+          userId: currentUser.id,
+          fileId: savedFile.id,
+        });
+      }
+      return response.status(201).json(savedFile);
     } catch (error) {
-      res.status(404).json({ error: "File couldn't be read" });
+      return response.status(400).json({
+        error: error.message,
+      });
     }
+  }
+
+  /**
+   * Returns a JSON response containing a file with the given id, if it belongs
+   * to the current user.
+   *
+   * @param {Object} request - the HTTP request object
+   * @param {Object} response - the HTTP response object
+   * @return {Promise<Object>} - a JSON response containing the file, or an
+   * error message
+   */
+  static async getShow(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
+
+    const { id } = request.params;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.findUserFileById(currentUser.id, id);
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    return response.status(200).json(file);
+  }
+
+  /**
+   * Retrieves a list of files belonging to the current user, filtered by
+   * `parentId` and `page`.
+   *
+   * @param {Object} request - The request object containing query parameters.
+   * @param {Object} response - The response object to send the list of files.
+   * @return {Object} The HTTP response object with status code 200 and a JSON
+   * array of files.
+   */
+  static async getIndex(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
+
+    let { parentId, page } = request.query;
+    if (parentId === '0' || !parentId) parentId = 0;
+    page = Number.isNaN(page) ? 0 : Number(page);
+
+    const filesCollection = new FilesCollection();
+    const files = await filesCollection.findAllUserFilesByParentId(
+      currentUser.id,
+      parentId,
+      page,
+    );
+
+    return response.status(200).json(files);
+  }
+
+  /**
+   * Executes an asynchronous method to publish a file.
+   *
+   * @param {Object} request - An object containing the request data.
+   * @param {Object} response - An object containing the response data.
+   * @return {Promise} A promise that resolves to the updated publication object.
+   */
+  static async putPublish(request, response) {
+    return FilesController.updatePublication(request, response, true);
+  }
+
+  /**
+   * Executes an asynchronous method to unpublish a file.
+   *
+   * @param {Object} request - the request object
+   * @param {Object} response - the response object
+   * @return {Promise} - a Promise that resolves with the updated publication
+   */
+  static async putUnpublish(request, response) {
+    return FilesController.updatePublication(request, response, false);
+  }
+
+  /**
+   * Updates the publication status of a file.
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @param {boolean} isPublished - The new publication status of the file.
+   * @return {Object} The updated file object as a JSON response.
+   */
+  static async updatePublication(request, response, isPublished) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
+    const { id } = request.params;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.updateFilePublication(
+      currentUser.id, id, isPublished,
+    );
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+    return response.status(200).json(file);
+  }
+
+  /**
+   * Retrieves a file from the server given a file id and sends it as a response
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @return {Promise} Resolves with the file data, or rejects with an error
+   * message.
+   */
+  static async getFile(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    const { id } = request.params;
+    const { size } = request.query;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.findPublicOrOwnFile(
+      currentUser ? currentUser.id : null,
+      id,
+    );
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    if (file.type === FOLDER) {
+      return response.status(400).json({
+        error: "A folder doesn't have content",
+      });
+    }
+
+    let filePath = file.localPath;
+    if (!Number.isNaN(size) && [500, 250, 100].includes(Number(size))) {
+      filePath += `_${size}`;
+    }
+
+    if (!existsSync(filePath)) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    const mimeType = mime.lookup(file.name);
+    response.set('Content-Type', mimeType);
+    const data = await readFile(filePath);
+    return response.status(200).send(data);
   }
 }
+
+export default FilesController;

@@ -1,4 +1,3 @@
 node_modules
-*main*
-healer*
-image_upload*
+data
+.DS_Store

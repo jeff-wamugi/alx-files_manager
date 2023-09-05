@@ -1,97 +1,109 @@
-import { MongoClient } from 'mongodb';
-import { promisify } from 'util';
+import { MongoClient, ObjectId } from 'mongodb';
+import sha1 from 'sha1';
 
+const DB_HOST = process.env.DB_HOST || 'localhost';
+const DB_PORT = process.env.DB_PORT || 27017;
+const DB_DATABASE = process.env.DB_DATABASE || 'files_manager';
+
+/**
+ * A MongoDB Client Class
+ */
 class DBClient {
   constructor() {
-    this._host = process.env.DB_HOST || 'localhost';
-    this._port = process.env.DB_PORT || 27017;
-    this._db = process.env.DB_DATABASE || 'files_manager';
     this.client = new MongoClient(
-      `mongodb://${this._host}:${this._port}/${this._db}`,
-      { useUnifiedTopology: true },
+      `mongodb://${DB_HOST}:${DB_PORT}/${DB_DATABASE}`,
     );
-    // start connection
-    this.client.connect();
+    this.isConnected = false;
+    this.db = null;
+    this.client.connect((err) => {
+      if (!err) {
+        this.isConnected = true;
+        this.db = this.client.db(DB_DATABASE);
+      }
+    });
   }
 
   /**
-   * checks if the database client is connected
+   * Checks if the mongoDb client is alive.
    *
-   * @returns {boolean} true if the client is connected else false
+   * @return {boolean} The connection status of the mongoDb.
    */
   isAlive() {
-    return this.client.isConnected();
+    return this.isConnected;
   }
 
   /**
-   * returns the number of users present in the db
-   * @returns {number} the number of users present
+   * Asynchronously counts the num of documents in the "users" collection.
+   *
+   * @return {Promise<number>} The num of documents in the "users" collection.
    */
   async nbUsers() {
-    const collection = this.client.db().collection('users');
-    return collection.countDocuments();
+    return this.db.collection('users').countDocuments();
   }
 
   /**
-   * returns the number of files present in the db
-   * @returns {number} the number of users present
+   * Calculates the number of files in the 'files' collection in the database.
+   *
+   * @return {Promise<number>} Returns a Promise that resolves to the number of
+   * files in the 'files' collection.
    */
   async nbFiles() {
-    const collection = this.client.db().collection('files');
-    return collection.countDocuments();
+    return this.db.collection('files').countDocuments();
   }
 
   /**
- * gets the obj matching the field passed if it's present
- * else null
- *
- * @param {string} collectn - collection to check in
- * @param {object} field - field to check for
- *
- * @returns {object|null} object matching field else null
-  */
-  async getField(collectn, field) {
-    const collection = this.client.db().collection(collectn);
-    const promFindOne = promisify(collection.findOne).bind(collection);
-    return promFindOne(field);
-  }
-
-  /**
-   * inserts the obj passed into the collection
-   * given
+   * Returns the 'files' collection from the database.
    *
-   * @param {string} collectn - collection to check in
-   * @param {object} obj - field obj to insert in the database
-   *
-   * @returns {object} the stored object with id
+   * @return {Collection} The 'files' collection.
    */
-  async insertCol(collectn, obj) {
-    const collection = this.client.db().collection(collectn);
-    const result = await collection.insertOne(obj);
-    return result.ops[0];
+  filesCollection() {
+    return this.db.collection('files');
   }
 
-  async getAll(collectn, obj, options) {
-    const collection = this.client.db().collection(collectn);
-    const { page } = options;
-    const limit = 20;
-    const pipe = [
-      { $match: obj },
-      { $skip: limit * page },
-      { $limit: limit },
-      { $addFields: { id: '$_id' } },
-      { $project: { _id: 0, localPath: 0 } },
-    ];
-
-    const cursor = collection.aggregate(pipe);
-    return cursor.toArray();
+  /**
+   * Finds a user by their email in the "users" collection.
+   *
+   * @param {string} email - The email of the user to find.
+   * @return {Promise} A Promise that resolves with the user object, or null if
+   * not found.
+   */
+  findUserByEmail(email) {
+    return this.db.collection('users').findOne({ email });
   }
 
-  async updateField(collectn, field, objToUpdate) {
-    const collection = this.client.db().collection(collectn);
-    // const promUpdateOne = promisify(collection.updateOne).bind(collection);
-    return collection.updateOne(field, { $set: objToUpdate });
+  /**
+   * Finds a user by their ID in the database.
+   *
+   * @param {string} userId - The ID of the user to find.
+   * @return {Promise<object>} A promise that resolves to the user object if
+   * found, or null if not found.
+   */
+  findUserById(userId) {
+    return this.db.collection('users').findOne({ _id: ObjectId(userId) });
+  }
+
+  /**
+   * Adds a new user to the database with the given email and password.
+   *
+   * @param {string} email - The email of the user to add.
+   * @param {string} password - The password of the user to add.
+   * @return {Object} The user object that was added to the database, with the
+   * password and _id fields removed.
+   */
+  async addUser(email, password) {
+    const hashedPassword = sha1(password);
+    const result = await this.db.collection('users').insertOne(
+      {
+        email,
+        password: hashedPassword,
+      },
+    );
+    return {
+      email: result.ops[0].email,
+      id: result.ops[0]._id,
+    };
   }
 }
-const dbClient = new DBClient();
-module.exports = dbClient;
+
+const dBClient = new DBClient();
+export default dBClient;
